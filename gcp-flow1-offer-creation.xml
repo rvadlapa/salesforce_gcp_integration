@@ -1,0 +1,395 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ============================================================
+  FLOW 1 — GCP MARKETPLACE: PRIVATE OFFER CREATION
+  ============================================================
+  Trigger  : HTTP POST /gcp/offer/create
+  Input    : JSON body with sfOpportunityId + sfQuoteId
+  Steps    :
+    1. Call Salesforce to fetch Opportunity + CPQ Quote
+    2. Get GCP Bearer token via JWT exchange
+    3. Build Private Offer payload (DataWeave)
+    4. POST to GCP Procurement API
+    5. Write GCP Offer ID back to Salesforce Opportunity
+  ============================================================
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+          http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+          http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+          http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/salesforce
+          http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd">
+
+  <!-- ═══════════════════════════════════════════════════════
+       GLOBAL CONFIGURATIONS
+  ═══════════════════════════════════════════════════════════ -->
+
+  <!-- HTTP Listener — entry point for offer creation trigger -->
+  <http:listener-config name="HTTP_Listener_Config"
+    doc:name="HTTP Listener Config">
+    <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+  </http:listener-config>
+
+  <!-- GCP Procurement API — HTTP Request config -->
+  <http:request-config name="GCP_Procurement_Request_Config"
+    doc:name="GCP Procurement API Config"
+    basePath="/v1">
+    <http:request-connection
+      protocol="HTTPS"
+      host="cloudcommerceprocurement.googleapis.com"
+      port="443"/>
+  </http:request-config>
+
+  <!-- GCP Token Endpoint — for JWT Bearer exchange -->
+  <http:request-config name="GCP_Token_Request_Config"
+    doc:name="GCP Token Endpoint Config">
+    <http:request-connection
+      protocol="HTTPS"
+      host="oauth2.googleapis.com"
+      port="443"/>
+  </http:request-config>
+
+  <!-- Salesforce connector — OAuth JWT Bearer to SFDC org -->
+  <salesforce:sfdc-config name="Salesforce_Config"
+    doc:name="Salesforce Config">
+    <salesforce:jwt-connection
+      consumerKey="${sfdc.consumer.key}"
+      keyStorePath="${sfdc.keystore.path}"
+      storePassword="${sfdc.keystore.password}"
+      principal="${sfdc.username}"
+      tokenEndpoint="${sfdc.token.endpoint}"/>
+  </salesforce:sfdc-config>
+
+
+  <!-- ═══════════════════════════════════════════════════════
+       SUBFLOW: GCP AUTH — JWT Bearer Token Exchange
+       Shared by all three touchpoint flows.
+       Stores token in flowVars.gcpAccessToken
+  ═══════════════════════════════════════════════════════════ -->
+  <sub-flow name="gcp-get-access-token" doc:name="GCP Get Access Token">
+
+    <!--
+      Build JWT assertion for GCP service account.
+      In production: use Crypto module or a custom Java component
+      to sign with RS256. Here we model the HTTP exchange.
+      Properties required in mule.properties / Anypoint Secrets:
+        gcp.service.account.email
+        gcp.private.key.pem    (RSA private key, base64)
+    -->
+    <ee:transform doc:name="Build JWT Assertion Body">
+      <ee:message>
+        <ee:set-payload><![CDATA[
+          %dw 2.0
+          output application/x-www-form-urlencoded
+          ---
+          {
+            // TODO: Replace vars.jwtAssertion with output from
+            //       a custom JWT-signing component or Crypto module.
+            //       The assertion must be RS256-signed using the
+            //       service account private key.
+            grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            assertion:  vars.jwtAssertion
+          }
+        ]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <http:request
+      config-ref="GCP_Token_Request_Config"
+      method="POST"
+      path="/token"
+      doc:name="Exchange JWT for Bearer Token">
+      <http:headers><![CDATA[#[{ "Content-Type": "application/x-www-form-urlencoded" }]]]></http:headers>
+    </http:request>
+
+    <!-- Extract and store the access token as a flow variable -->
+    <ee:transform doc:name="Extract Access Token">
+      <ee:variables>
+        <ee:set-variable variableName="gcpAccessToken"><![CDATA[
+          %dw 2.0
+          output application/java
+          ---
+          payload.access_token
+        ]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+  </sub-flow>
+
+
+  <!-- ═══════════════════════════════════════════════════════
+       MAIN FLOW: CREATE PRIVATE OFFER
+  ═══════════════════════════════════════════════════════════ -->
+  <flow name="gcp-create-private-offer-flow" doc:name="GCP Create Private Offer">
+
+    <!-- Step 0: Accept trigger -->
+    <http:listener
+      config-ref="HTTP_Listener_Config"
+      path="/gcp/offer/create"
+      doc:name="POST /gcp/offer/create"
+      allowedMethods="POST"/>
+
+    <!-- Store incoming request IDs as variables -->
+    <ee:transform doc:name="Extract Request Params">
+      <ee:variables>
+        <ee:set-variable variableName="sfOpportunityId"><![CDATA[
+          %dw 2.0 output application/java --- payload.sfOpportunityId
+        ]]></ee:set-variable>
+        <ee:set-variable variableName="sfQuoteId"><![CDATA[
+          %dw 2.0 output application/java --- payload.sfQuoteId
+        ]]></ee:set-variable>
+        <ee:set-variable variableName="gcpPartnerId"><![CDATA[
+          %dw 2.0 output application/java --- p('gcp.partner.id')
+        ]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+
+    <!-- ── STEP 1: Fetch Opportunity from Salesforce ── -->
+    <salesforce:query
+      config-ref="Salesforce_Config"
+      doc:name="Query Opportunity">
+      <salesforce:sql><![CDATA[
+        SELECT Id, AccountId, Account.Name,
+               GCP_Billing_Account_ID__c,
+               GCP_Product_ID__c,
+               GCP_Plan_ID__c
+        FROM   Opportunity
+        WHERE  Id = ':sfOpportunityId'
+      ]]></salesforce:sql>
+      <salesforce:parameters><![CDATA[
+        #[{ sfOpportunityId: vars.sfOpportunityId }]
+      ]]></salesforce:parameters>
+    </salesforce:query>
+
+    <ee:transform doc:name="Store Opportunity">
+      <ee:variables>
+        <ee:set-variable variableName="sfOpportunity"><![CDATA[
+          %dw 2.0 output application/java --- payload[0]
+        ]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+
+    <!-- ── STEP 2: Fetch CPQ Quote + Payment Installments ── -->
+    <salesforce:query
+      config-ref="Salesforce_Config"
+      doc:name="Query CPQ Quote with Installments">
+      <salesforce:sql><![CDATA[
+        SELECT Id, CurrencyIsoCode,
+               SBQQ__StartDate__c, SBQQ__EndDate__c,
+               SBQQ__PartnerDiscount__c,
+               (SELECT Due_Date__c, Amount__c
+                FROM   Payment_Installments__r
+                ORDER BY Due_Date__c ASC)
+        FROM   SBQQ__Quote__c
+        WHERE  Id = ':sfQuoteId'
+      ]]></salesforce:sql>
+      <salesforce:parameters><![CDATA[
+        #[{ sfQuoteId: vars.sfQuoteId }]
+      ]]></salesforce:parameters>
+    </salesforce:query>
+
+    <ee:transform doc:name="Store Quote">
+      <ee:variables>
+        <ee:set-variable variableName="sfQuote"><![CDATA[
+          %dw 2.0 output application/java --- payload[0]
+        ]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+
+    <!-- ── STEP 3: Get GCP Bearer Token ── -->
+    <flow-ref name="gcp-get-access-token" doc:name="Get GCP Token"/>
+
+
+    <!-- ── STEP 4: Build GCP Private Offer Payload (DataWeave) ── -->
+    <ee:transform doc:name="Build GCP Offer Payload">
+      <ee:message>
+        <ee:set-payload><![CDATA[
+          %dw 2.0
+          output application/json
+          ---
+          {
+            // Customer's GCP billing account (from Opportunity custom field)
+            buyerBillingAccountId: vars.sfOpportunity.GCP_Billing_Account_ID__c,
+
+            // GCP product service name — format: <product>.mp-<partner>.appspot.com
+            productExternalName: vars.sfOpportunity.GCP_Product_ID__c
+              ++ ".mp-" ++ vars.gcpPartnerId ++ ".appspot.com",
+
+            // Plan ID registered in GCP Marketplace
+            planExternalName: vars.sfOpportunity.GCP_Plan_ID__c,
+
+            // Offer display name visible to buyer in GCP Console
+            name: "Private Offer for " ++ vars.sfOpportunity."Account.Name",
+
+            // Contract period (ISO 8601 UTC)
+            startTime: vars.sfQuote.SBQQ__StartDate__c ++ "T00:00:00Z",
+            endTime:   vars.sfQuote.SBQQ__EndDate__c   ++ "T00:00:00Z",
+
+            // Discount off list price (0.0 – 1.0)
+            discount: (vars.sfQuote.SBQQ__PartnerDiscount__c default 0) / 100,
+
+            // Payment schedule — maps CPQ installment records to GCP schedule
+            paymentSchedule: vars.sfQuote.Payment_Installments__r.records map (inst) -> {
+              billingTime: inst.Due_Date__c ++ "T00:00:00Z",
+              price: {
+                currencyCode: vars.sfQuote.CurrencyIsoCode,
+                // GCP expects units (whole dollars) and nanos (fractional cents)
+                units: floor(inst.Amount__c) as String,
+                nanos: ((inst.Amount__c mod 1) * 1000000000) as Number as String
+              }
+            },
+
+            // Cross-reference back to Salesforce for reconciliation
+            partnerMetadata: {
+              sfOpportunityId: vars.sfOpportunityId,
+              sfQuoteId:       vars.sfQuoteId,
+              sfAccountId:     vars.sfOpportunity.AccountId
+            }
+          }
+        ]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+
+    <!-- ── STEP 5: POST to GCP Procurement API ── -->
+    <http:request
+      config-ref="GCP_Procurement_Request_Config"
+      method="POST"
+      path="/providers/$(vars.gcpPartnerId)/privateOffers"
+      doc:name="POST Create Private Offer to GCP">
+      <http:headers><![CDATA[#[{
+        "Authorization": "Bearer " ++ vars.gcpAccessToken,
+        "Content-Type":  "application/json"
+      }]]]></http:headers>
+    </http:request>
+
+    <!-- Store GCP response -->
+    <ee:transform doc:name="Store GCP Offer Response">
+      <ee:variables>
+        <ee:set-variable variableName="gcpOfferResponse"><![CDATA[
+          %dw 2.0
+          output application/java
+          ---
+          {
+            gcpOfferId: payload.name,
+            offerUrl:   payload.offerUrl,
+            status:     payload.state
+          }
+        ]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+
+    <!-- ── STEP 6: Create GCP_Offer__c record in Salesforce ── -->
+    <salesforce:create
+      config-ref="Salesforce_Config"
+      type="GCP_Offer__c"
+      doc:name="Insert GCP_Offer__c Record">
+      <salesforce:records><![CDATA[#[[{
+        Opportunity__c:   vars.sfOpportunityId,
+        GCP_Offer_ID__c:  vars.gcpOfferResponse.gcpOfferId,
+        GCP_Offer_URL__c: vars.gcpOfferResponse.offerUrl,
+        Status__c:        "Sent",
+        Sent_Date__c:     now() as String { format: "yyyy-MM-dd" }
+      }]]]]></salesforce:records>
+    </salesforce:create>
+
+
+    <!-- ── STEP 7: Update Opportunity with GCP Offer ID ── -->
+    <salesforce:update
+      config-ref="Salesforce_Config"
+      type="Opportunity"
+      doc:name="Update Opportunity with GCP Offer ID">
+      <salesforce:records><![CDATA[#[[{
+        Id:                  vars.sfOpportunityId,
+        GCP_Offer_ID__c:     vars.gcpOfferResponse.gcpOfferId,
+        GCP_Offer_URL__c:    vars.gcpOfferResponse.offerUrl,
+        GCP_Offer_Status__c: vars.gcpOfferResponse.status
+      }]]]]></salesforce:records>
+    </salesforce:update>
+
+
+    <!-- ── STEP 8: Build success response ── -->
+    <ee:transform doc:name="Build Success Response">
+      <ee:message>
+        <ee:set-payload><![CDATA[
+          %dw 2.0
+          output application/json
+          ---
+          {
+            status:     "success",
+            gcpOfferId: vars.gcpOfferResponse.gcpOfferId,
+            offerUrl:   vars.gcpOfferResponse.offerUrl,
+            message:    "Private Offer created and synced to Salesforce"
+          }
+        ]]></ee:set-payload>
+      </ee:message>
+      <ee:variables>
+        <ee:set-variable variableName="httpStatus">201</ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+
+    <!-- ── ERROR HANDLING ── -->
+    <error-handler>
+      <on-error-propagate
+        type="HTTP:BAD_REQUEST, HTTP:UNAUTHORIZED, HTTP:NOT_FOUND"
+        doc:name="GCP API Error">
+        <ee:transform doc:name="GCP Error Response">
+          <ee:message>
+            <ee:set-payload><![CDATA[
+              %dw 2.0
+              output application/json
+              ---
+              {
+                status:  "error",
+                source:  "GCP Procurement API",
+                code:    error.errorMessage.attributes.statusCode,
+                message: error.description
+              }
+            ]]></ee:set-payload>
+          </ee:message>
+          <ee:variables>
+            <ee:set-variable variableName="httpStatus">500</ee:set-variable>
+          </ee:variables>
+        </ee:transform>
+      </on-error-propagate>
+
+      <on-error-propagate
+        type="SALESFORCE:INVALID_INPUT, SALESFORCE:CONNECTIVITY"
+        doc:name="Salesforce Error">
+        <ee:transform doc:name="SFDC Error Response">
+          <ee:message>
+            <ee:set-payload><![CDATA[
+              %dw 2.0
+              output application/json
+              ---
+              {
+                status:  "error",
+                source:  "Salesforce",
+                message: error.description
+              }
+            ]]></ee:set-payload>
+          </ee:message>
+          <ee:variables>
+            <ee:set-variable variableName="httpStatus">500</ee:set-variable>
+          </ee:variables>
+        </ee:transform>
+      </on-error-propagate>
+    </error-handler>
+
+  </flow>
+
+</mule>
